@@ -54,6 +54,15 @@ from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
 from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
 from nnunetv2.training.logging.nnunet_logger import nnUNetLogger
 from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss
+
+# Import the custom mammography loss.  This implements the ratio‑adaptive
+# weighting between Dice and BCE for binary segmentation tasks.  We guard the
+# import so that nnU‑Net remains usable even if the custom loss file is not
+# present.
+try:
+    from nnunetv2.training.loss.mammography_losses import RatioAdaptiveBCEDiceLoss
+except ImportError:
+    RatioAdaptiveBCEDiceLoss = None
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn, MemoryEfficientSoftDiceLoss
 from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
@@ -389,37 +398,76 @@ class nnUNetTrainer(object):
             self.oversample_foreground_percent = oversample_percent
 
     def _build_loss(self):
-        if self.label_manager.has_regions:
-            loss = DC_and_BCE_loss({},
-                                   {'batch_dice': self.configuration_manager.batch_dice,
-                                    'do_bg': True, 'smooth': 1e-5, 'ddp': self.is_ddp},
-                                   use_ignore_label=self.label_manager.ignore_label is not None,
-                                   dice_class=MemoryEfficientSoftDiceLoss)
-        else:
-            loss = DC_and_CE_loss({'batch_dice': self.configuration_manager.batch_dice,
-                                   'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1, weight_dice=1,
-                                  ignore_label=self.label_manager.ignore_label, dice_class=MemoryEfficientSoftDiceLoss)
+        """
+        Constructs and returns the loss function for training.
 
-        if self._do_i_compile():
+        By default nnU‑Net uses a compound Dice + Cross Entropy (CE) or Dice +
+        Binary Cross Entropy (BCE) loss depending on whether region labels are
+        employed.  For binary segmentation problems (one segmentation head and
+        no region labels) we instead use a custom loss that adaptively
+        reweights Dice and BCE terms based on the relative size of the mass in
+        each sample.  This adaptive loss implements the ratio‑based ASP
+        formulation proposed for mammography segmentation and is defined in
+        ``nnunetv2/training/loss/mammography_losses.py``.
+        """
+        # Decide whether to use the custom ratio‑adaptive loss.  We only use it
+        # when it is available, the problem is binary and there are no region
+        # labels.  If any of these conditions is not met, we fall back to
+        # nnU‑Net's default compound losses.
+        use_custom_ratio_loss = False
+        if RatioAdaptiveBCEDiceLoss is not None:
+            # Binary segmentation corresponds to a single segmentation head.
+            num_heads = getattr(self.label_manager, 'num_segmentation_heads', None)
+            if (not self.label_manager.has_regions) and (num_heads == 1):
+                use_custom_ratio_loss = True
+
+        if use_custom_ratio_loss:
+            # Initialize the ratio‑adaptive loss.  Hyperparameters can be
+            # tuned by modifying the arguments here or by exposing them via
+            # environment variables.  The defaults (initial_dice_weight = 1,
+            # initial_bce_weight = 1, g = 0.3) follow recommendations from
+            # the ASP paper【900682516222126†screenshot】.
+            loss: nn.Module = RatioAdaptiveBCEDiceLoss(
+                initial_dice_weight=1.0,
+                initial_bce_weight=1.0,
+                g=0.3,
+                smooth=1e-5,
+                ddp=self.is_ddp
+            )
+        else:
+            # Use the default nnU‑Net losses.  With region labels we need a
+            # BCE+Dice combination; otherwise we use a CE+Dice combination.  A
+            # smooth term of 1e‑5 is added to the Dice loss to stabilise
+            # training.
+            if self.label_manager.has_regions:
+                loss = DC_and_BCE_loss({},
+                                       {'batch_dice': self.configuration_manager.batch_dice,
+                                        'do_bg': True, 'smooth': 1e-5, 'ddp': self.is_ddp},
+                                       use_ignore_label=self.label_manager.ignore_label is not None,
+                                       dice_class=MemoryEfficientSoftDiceLoss)
+            else:
+                loss = DC_and_CE_loss({'batch_dice': self.configuration_manager.batch_dice,
+                                       'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1, weight_dice=1,
+                                      ignore_label=self.label_manager.ignore_label, dice_class=MemoryEfficientSoftDiceLoss)
+
+        # If the loss exposes a Dice component (dc) we can compile it for
+        # efficiency.  Our custom loss does not have this attribute.
+        if self._do_i_compile() and hasattr(loss, 'dc'):
             loss.dc = torch.compile(loss.dc)
 
-        # we give each output a weight which decreases exponentially (division by 2) as the resolution decreases
-        # this gives higher resolution outputs more weight in the loss
-
+        # Assign weights to the deep supervision outputs.  Each additional
+        # auxiliary output receives half the weight of the previous one, and
+        # the lowest resolution output receives zero weight by default.  In
+        # DDP mode without compilation we avoid zero weight to prevent
+        # unused‑parameter errors.
         if self.enable_deep_supervision:
             deep_supervision_scales = self._get_deep_supervision_scales()
             weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
             if self.is_ddp and not self._do_i_compile():
-                # very strange and stupid interaction. DDP crashes and complains about unused parameters due to
-                # weights[-1] = 0. Interestingly this crash doesn't happen with torch.compile enabled. Strange stuff.
-                # Anywho, the simple fix is to set a very low weight to this.
                 weights[-1] = 1e-6
             else:
                 weights[-1] = 0
-
-            # we don't use the lowest 2 outputs. Normalize weights so that they sum to 1
             weights = weights / weights.sum()
-            # now wrap the loss
             loss = DeepSupervisionWrapper(loss, weights)
 
         return loss
